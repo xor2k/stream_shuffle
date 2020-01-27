@@ -6,7 +6,9 @@
 #include <algorithm>
 
 // Forward function declaration.
-static PyObject *shuffle(PyObject *self, PyObject *args);
+static PyObject *create_shuffle(PyObject *self, PyObject *args);
+static PyObject *get_batch_count(PyObject *self, PyObject *args);
+
 static PyObject *create_batch(PyObject *self, PyObject *args);
 static PyObject *get_X(PyObject *self, PyObject *args);
 static PyObject *get_y_lower_in(PyObject *self, PyObject *args);
@@ -16,7 +18,9 @@ static PyObject *get_y_upper_out(PyObject *self, PyObject *args);
 
 // Boilerplate: method list.
 static PyMethodDef methods[] = {
-    { "shuffle", shuffle, METH_VARARGS, "Doc string."},
+    { "create_shuffle", create_shuffle, METH_VARARGS, "Doc string."},
+    { "get_batch_count", get_batch_count, METH_NOARGS, "Doc string."},
+
     { "create_batch", create_batch, METH_NOARGS, "Doc string."},
     { "get_X", get_X, METH_NOARGS, "Doc string."},
     { "get_y_lower_in", get_y_lower_in, METH_NOARGS, "Doc string."},
@@ -112,16 +116,20 @@ static struct data_struct {
     npy_float32* labels_out;
 } data;
 
+static struct shuffle_struct {
+    size_t* shuffled_ids;
+    size_t* aggregation_lengths;
+    size_t aggregation_count;
+    size_t batch_count;
+} shuffle;
+
 static struct batch_struct {
     size_t current_stream;
+    size_t current_aggregation;
     size_t batch_size;
-    size_t batch_count;
     size_t batch_id;
     size_t frame_count;
     
-    size_t* aggregation_lengths;
-    size_t* shuffled_ids;
-
     pixel_type* X;
     npy_float32* y_lower_in;
     npy_float32* y_upper_in;
@@ -132,10 +140,10 @@ static struct batch_struct {
 /*****************************************************************************
  * shuffle                                                                   *
  *****************************************************************************/
-static PyObject *shuffle(PyObject *self, PyObject *args) {
-
-    memset(&batch, 0, sizeof(struct batch_struct));
+static PyObject *create_shuffle(PyObject *self, PyObject *args) {
     memset(&data, 0, sizeof(struct data_struct));
+    memset(&shuffle, 0, sizeof(struct shuffle_struct));
+    memset(&batch, 0, sizeof(struct batch_struct));
 
     npy_int64 aggregation_length_min;
     npy_int64 aggregation_length_max;
@@ -166,11 +174,10 @@ static PyObject *shuffle(PyObject *self, PyObject *args) {
     size_t aggregation_length_delta = aggregation_length_max - aggregation_length_min;
     size_t remaining_count = data.stream_count;
 
-    batch.aggregation_lengths = (size_t*)realloc(
-        batch.aggregation_lengths,
+    shuffle.aggregation_lengths = (size_t*)realloc(
+        shuffle.aggregation_lengths,
         sizeof(size_t)*(data.stream_count/aggregation_length_min+1)
     );
-    size_t aggregation_count = 0;
 
     while(remaining_count > 0){
         size_t tmp = (size_t)fmin(
@@ -178,8 +185,8 @@ static PyObject *shuffle(PyObject *self, PyObject *args) {
             remaining_count
         );
         remaining_count -= tmp;
-        batch.aggregation_lengths[aggregation_count] = tmp;
-        aggregation_count++;
+        shuffle.aggregation_lengths[shuffle.aggregation_count] = tmp;
+        shuffle.aggregation_count++;
     }
 
     data.stream_pixel_counts = (size_t*)realloc(
@@ -206,9 +213,11 @@ static PyObject *shuffle(PyObject *self, PyObject *args) {
         data.labels_out[i] = labels_out(i);
     }
 
-    free(batch.shuffled_ids);
-    batch.shuffled_ids = make_shuffled_ids(data.stream_count);
-    batch.batch_count = aggregation_count / batch.batch_size;
+    free(shuffle.shuffled_ids);
+    shuffle.shuffled_ids = make_shuffled_ids(data.stream_count);
+    shuffle.batch_count = (size_t)ceil(
+        (double)shuffle.aggregation_count / (double)batch.batch_size
+    );
     batch.current_stream = 0;
 
     Py_RETURN_NONE;
@@ -216,19 +225,23 @@ static PyObject *shuffle(PyObject *self, PyObject *args) {
 }
 
 static PyObject *create_batch(PyObject *self, PyObject *args) {
-
-    if(batch.batch_id == batch.batch_count){
+    if(batch.batch_id == shuffle.batch_count){
         Py_RETURN_NONE;
     }
 
     auto old_current_stream = batch.current_stream;
     size_t longest_merged_stream_pixel_count = 0;
 
-    for(size_t j = 0; j < batch.batch_size; j++){
-        size_t aggregation_length = batch.aggregation_lengths[j];
+    auto last_aggregation = (size_t)fmin(
+        shuffle.aggregation_count,
+        batch.current_aggregation + batch.batch_size
+    );
+
+    for(size_t j = batch.current_aggregation; j < last_aggregation; j++){
+        size_t aggregation_length = shuffle.aggregation_lengths[j];
         size_t stream_pixel_length_sum = 0;
         for(size_t k = 0; k < aggregation_length; k++){
-            size_t shuffled_id = batch.shuffled_ids[
+            size_t shuffled_id = shuffle.shuffled_ids[
                 batch.current_stream + k
             ];
             stream_pixel_length_sum += data.stream_pixel_counts[shuffled_id];
@@ -262,8 +275,11 @@ static PyObject *create_batch(PyObject *self, PyObject *args) {
 
     batch.current_stream = old_current_stream;
 
-    for(size_t j = 0; j < batch.batch_size; j++){
-        auto aggregation_length = batch.aggregation_lengths[j];
+    size_t j = 0;
+    for(size_t j_ = batch.current_aggregation; j_ < last_aggregation; j_++){
+        j = j_ - batch.current_aggregation;
+
+        auto aggregation_length = shuffle.aggregation_lengths[j_];
         size_t stream_pixel_sum = 0;
         size_t stream_frame_sum = 0;
 
@@ -273,7 +289,7 @@ static PyObject *create_batch(PyObject *self, PyObject *args) {
         size_t aggregation_upper_bound_out = 0;
         
         for(size_t k = 0; k < aggregation_length; k++){
-            auto shuffled_id = batch.shuffled_ids[
+            auto shuffled_id = shuffle.shuffled_ids[
                 batch.current_stream + k
             ];
             auto label_in = data.labels_in[shuffled_id];
@@ -391,6 +407,7 @@ static PyObject *create_batch(PyObject *self, PyObject *args) {
         batch.current_stream += aggregation_length;
     }
 
+    batch.current_aggregation = last_aggregation;
     batch.frame_count = batch.batch_size*longest_merged_stream_pixel_count/FRAME_PIXEL_COUNT;
     batch.batch_id++;
 
