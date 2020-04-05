@@ -35,6 +35,7 @@ typedef npy_float32 label_type;
 #define FRAME_WIDTH 25
 #define FRAME_HEIGHT 20
 #define FRAME_PIXEL_COUNT (FRAME_WIDTH*FRAME_HEIGHT)
+#define MASK_TOKEN -2
 
 // Boilerplate: Module initialization.
 // Compare http://python3porting.com/cextensions.html
@@ -56,19 +57,20 @@ typedef npy_float32 label_type;
 
 MOD_INIT(sequence_shuffle)
 {
-        // deactivate this for debugging
-        srand (time(NULL));
+    // deactivate this for debugging
+    // srand (time(NULL));
+    srand(0);
 
-        PyObject *m;
+    PyObject *m;
 
-        MOD_DEF(m, "sequence_shuffle", "some doc here", methods)
+    MOD_DEF(m, "sequence_shuffle", "some doc here", methods)
 
-        if (m == NULL)
-            return MOD_ERROR_VAL;
+    if (m == NULL)
+        return MOD_ERROR_VAL;
 
-        import_array();
+    import_array();
 
-        return MOD_SUCCESS_VAL(m);
+    return MOD_SUCCESS_VAL(m);
 
 }
 
@@ -108,34 +110,41 @@ static size_t* make_shuffled_ids (size_t n) {
                                 (x0) * PyArray_STRIDES(py_labels_out)[0])))
 
 static struct data_struct {
-    size_t stream_count;
-    size_t* stream_pixel_counts;
-    size_t* stream_pixel_offsets;
     pixel_type* data;
-    npy_float32* labels_in;
-    npy_float32* labels_out;
+    size_t video_count;
+
+    size_t* video_pixel_counts;
+    size_t* video_pixel_offsets;
+
+    label_type* labels_in;
+    label_type* labels_out;
 } data;
 
 static struct shuffle_struct {
     size_t* shuffled_ids;
-    size_t* aggregation_lengths;
-    size_t aggregation_count;
-    size_t batch_count;
 } shuffle;
 
-static struct batch_struct {
-    size_t current_stream;
-    size_t current_aggregation;
+static struct options_struct {
     size_t batch_size;
+    size_t aggregation_length;
+    size_t batch_count;
+} options;
+
+static struct batch_struct {
     size_t batch_id;
     size_t frame_count;
-    
+    size_t* aggregation_pixel_counts;
+
     pixel_type* X;
-    npy_float32* y_lower_in;
-    npy_float32* y_upper_in;
-    npy_float32* y_lower_out;
-    npy_float32* y_upper_out;
+    label_type* y_lower_in;
+    label_type* y_upper_in;
+    label_type* y_lower_out;
+    label_type* y_upper_out;
 } batch;
+
+static struct epoch_state_struct {
+    size_t current_batch_id;
+} epoch_state;
 
 /*****************************************************************************
  * shuffle                                                                   *
@@ -144,19 +153,18 @@ static PyObject *create_shuffle(PyObject *self, PyObject *args) {
     memset(&data, 0, sizeof(struct data_struct));
     memset(&shuffle, 0, sizeof(struct shuffle_struct));
     memset(&batch, 0, sizeof(struct batch_struct));
+    memset(&options, 0, sizeof(struct options_struct));
+    memset(&epoch_state, 0, sizeof(struct epoch_state_struct));
 
-    npy_int64 aggregation_length_min;
-    npy_int64 aggregation_length_max;
     PyArrayObject *py_data;
     PyArrayObject *py_offsets;
     PyArrayObject *py_labels_in;
     PyArrayObject *py_labels_out;
 
     if (!PyArg_ParseTuple(
-        args, "lllO!O!O!O!",
-        &batch.batch_size,
-        &aggregation_length_min,
-        &aggregation_length_max,
+        args, "kkO!O!O!O!",
+        &options.batch_size,
+        &options.aggregation_length,
         &PyArray_Type, &py_data,
         &PyArray_Type, &py_offsets,
         &PyArray_Type, &py_labels_in,
@@ -165,104 +173,98 @@ static PyObject *create_shuffle(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    batch.batch_id = 0;
-
-    data.stream_count = PyArray_SIZE(py_offsets);
+    // initialize data
+    data.video_count = PyArray_SIZE(py_offsets);
     size_t data_length = PyArray_SIZE(py_data);
     data.data = (pixel_type*)PyArray_DATA(py_data);
 
-    size_t aggregation_length_delta = aggregation_length_max - aggregation_length_min;
-    size_t remaining_count = data.stream_count;
-
-    shuffle.aggregation_lengths = (size_t*)realloc(
-        shuffle.aggregation_lengths,
-        sizeof(size_t)*(data.stream_count/aggregation_length_min+1)
+    data.video_pixel_counts = (size_t*)realloc(
+        data.video_pixel_counts, sizeof(size_t)*data.video_count
     );
 
-    while(remaining_count > 0){
-        size_t tmp = (size_t)fmin(
-            aggregation_length_min + (rand() % (aggregation_length_delta + 1)),
-            remaining_count
-        );
-        remaining_count -= tmp;
-        shuffle.aggregation_lengths[shuffle.aggregation_count] = tmp;
-        shuffle.aggregation_count++;
-    }
-
-    data.stream_pixel_counts = (size_t*)realloc(
-        data.stream_pixel_counts, sizeof(size_t)*data.stream_count
-    );
-
-    data.stream_pixel_offsets = (size_t*)realloc(
-        data.stream_pixel_offsets, sizeof(size_t)*data.stream_count
+    data.video_pixel_offsets = (size_t*)realloc(
+        data.video_pixel_offsets, sizeof(size_t)*data.video_count
     );
 
     data.labels_in = (npy_float32*)realloc(
-        data.labels_in, sizeof(npy_float32)*data.stream_count
+        data.labels_in, sizeof(npy_float32)*data.video_count
     );
 
     data.labels_out = (npy_float32*)realloc(
-        data.labels_out, sizeof(npy_float32)*data.stream_count
+        data.labels_out, sizeof(npy_float32)*data.video_count
     );
 
-    for(size_t i=0; i<data.stream_count; i++){
-        data.stream_pixel_counts[i] = i == data.stream_count - 1 ?
+    for(size_t i=0; i<data.video_count; i++){
+        data.video_pixel_counts[i] = i == data.video_count - 1 ?
             data_length - offsets(i) : offsets(i+1)-offsets(i);
-        data.stream_pixel_offsets[i] = offsets(i);
+        data.video_pixel_offsets[i] = offsets(i);
         data.labels_in[i] = labels_in(i);
         data.labels_out[i] = labels_out(i);
     }
 
+    // initialize shuffle
     free(shuffle.shuffled_ids);
-    shuffle.shuffled_ids = make_shuffled_ids(data.stream_count);
-    shuffle.batch_count = (size_t)ceil(
-        (double)shuffle.aggregation_count / (double)batch.batch_size
+    shuffle.shuffled_ids = make_shuffled_ids(data.video_count);
+    options.batch_count = (size_t)ceil((double) data.video_count / (
+        (double) options.aggregation_length *
+        (double) options.batch_size
+    ));
+
+    // initialize batch
+    batch.batch_id = 0;
+    epoch_state.current_batch_id = 0;
+
+    batch.aggregation_pixel_counts = (size_t*) realloc(
+        batch.aggregation_pixel_counts,
+        sizeof(size_t) * options.batch_size
     );
-    batch.current_stream = 0;
 
     Py_RETURN_NONE;
 
 }
 
 static PyObject *create_batch(PyObject *self, PyObject *args) {
-    if(batch.batch_id == shuffle.batch_count){
+    if(batch.batch_id == options.batch_count){
         Py_RETURN_NONE;
     }
 
-    auto old_current_stream = batch.current_stream;
-    size_t longest_merged_stream_pixel_count = 0;
-
-    auto last_aggregation = (size_t)fmin(
-        shuffle.aggregation_count,
-        batch.current_aggregation + batch.batch_size
+    memset(
+        batch.aggregation_pixel_counts, 0, sizeof(size_t)*options.batch_size
     );
 
-    for(size_t j = batch.current_aggregation; j < last_aggregation; j++){
-        size_t aggregation_length = shuffle.aggregation_lengths[j];
-        size_t stream_pixel_length_sum = 0;
-        for(size_t k = 0; k < aggregation_length; k++){
-            size_t shuffled_id = shuffle.shuffled_ids[
-                batch.current_stream + k
-            ];
-            stream_pixel_length_sum += data.stream_pixel_counts[shuffled_id];
+    batch.batch_id = epoch_state.current_batch_id++;
+
+    size_t batch_first_video_index =
+        data.video_count / options.batch_count * batch.batch_id;
+
+    size_t batch_last_video_index = std::min(
+        batch_first_video_index +
+        options.batch_size * options.aggregation_length,
+        data.video_count
+    );
+
+    size_t longest_aggregation_pixel_count = 0;
+    size_t current_aggregation_pixel_count = 0;
+    for(size_t i = batch_first_video_index; i < batch_last_video_index; i++){
+        if((i-batch_first_video_index)%options.aggregation_length == 0){
+            current_aggregation_pixel_count = 0;
         }
-        longest_merged_stream_pixel_count = (size_t)fmax(
-            longest_merged_stream_pixel_count,
-            stream_pixel_length_sum
+        size_t shuffled_id = shuffle.shuffled_ids[i];
+        current_aggregation_pixel_count+=data.video_pixel_counts[shuffled_id];
+
+        longest_aggregation_pixel_count = std::max(
+            longest_aggregation_pixel_count,
+            current_aggregation_pixel_count
         );
-        batch.current_stream += aggregation_length;
     }
 
     batch.X = (pixel_type*)realloc(
         batch.X, sizeof(pixel_type)*
-        batch.batch_size*longest_merged_stream_pixel_count
+        options.batch_size*longest_aggregation_pixel_count
     );
 
-    auto longest_merged_stream_frame_count =
-        longest_merged_stream_pixel_count/FRAME_PIXEL_COUNT;
-
-    auto y_byte_count = sizeof(pixel_type)*batch.batch_size*
-        longest_merged_stream_frame_count;
+    auto y_byte_count = sizeof(pixel_type)*options.batch_size*
+        longest_aggregation_pixel_count/FRAME_PIXEL_COUNT;
 
     auto y_ptrs = {
         &batch.y_lower_in, &batch.y_lower_out,
@@ -273,143 +275,155 @@ static PyObject *create_batch(PyObject *self, PyObject *args) {
         *ptr = (label_type*)realloc(*ptr, y_byte_count);
     }
 
-    batch.current_stream = old_current_stream;
+    size_t aggregation_lower_bound_in = 0;
+    size_t aggregation_lower_bound_out = 0;
+    size_t aggregation_upper_bound_in = 0;
+    size_t aggregation_upper_bound_out = 0;
+    size_t aggregation_pixel_count = 0;
+    size_t aggregation_current_index = 0;
+    for(size_t i = batch_first_video_index; i < batch_last_video_index; i++){
+        size_t i_rel = (i-batch_first_video_index)%options.aggregation_length;
+        if(i_rel == 0){
+            aggregation_current_index =
+                i == batch_first_video_index ? 0 : aggregation_current_index+1;
 
-    size_t j = 0;
-    for(size_t j_ = batch.current_aggregation; j_ < last_aggregation; j_++){
-        j = j_ - batch.current_aggregation;
+            aggregation_lower_bound_in = 0;
+            aggregation_lower_bound_out = 0;
+            aggregation_upper_bound_in = 0;
+            aggregation_upper_bound_out = 0;
 
-        auto aggregation_length = shuffle.aggregation_lengths[j_];
-        size_t stream_pixel_sum = 0;
-        size_t stream_frame_sum = 0;
-
-        size_t aggregation_lower_bound_in = 0;
-        size_t aggregation_upper_bound_in = 0;
-        size_t aggregation_lower_bound_out = 0;
-        size_t aggregation_upper_bound_out = 0;
-        
-        for(size_t k = 0; k < aggregation_length; k++){
-            auto shuffled_id = shuffle.shuffled_ids[
-                batch.current_stream + k
-            ];
-            auto label_in = data.labels_in[shuffled_id];
-            auto label_out = data.labels_out[shuffled_id];
-
-            // printf("%f %f\n", label_in, label_out);
-
-            auto stream_pixel_count = data.stream_pixel_counts[shuffled_id];
-            auto stream_frame_count = stream_pixel_count / FRAME_PIXEL_COUNT;
-            auto data_pixel_offset = data.stream_pixel_offsets[shuffled_id];
-
-            int mode = rand() % 4;
-            size_t do_reverse = mode == 2 || mode == 3;
-
-            aggregation_upper_bound_in += do_reverse ? label_out : label_in;
-            aggregation_upper_bound_out += do_reverse ? label_in : label_out;
-
-            for(auto tmp : y_ptrs){
-                auto ptr = *tmp + stream_frame_sum + j*longest_merged_stream_frame_count;
-                std::fill(ptr, ptr + stream_frame_count,
-                    ptr == batch.y_lower_in ? aggregation_lower_bound_in :
-                    ptr == batch.y_lower_out ? aggregation_lower_bound_out :
-                    ptr == batch.y_upper_in ? aggregation_upper_bound_in :
-                    aggregation_upper_bound_out
-                );
-            }
-
-            switch(mode){
-                // plain copy
-                case 0:
-                    memcpy(
-                        &batch.X[stream_pixel_sum],
-                        &data.data[data_pixel_offset],
-
-                        stream_pixel_count*sizeof(pixel_type)
-                    );
-                    break;
-                // mirror
-                case 1:
-                    for(size_t l = 0; l < stream_frame_count; l++){
-                        auto frame_offset = l * FRAME_PIXEL_COUNT;
-                        for(size_t m = 0; m < FRAME_WIDTH; m++){
-                            for(size_t n = 0; n < FRAME_HEIGHT; n++){
-                                batch.X[
-                                    stream_pixel_sum + frame_offset +
-                                    n * FRAME_WIDTH + m
-                                ] = data.data[
-                                    data_pixel_offset + frame_offset +
-                                    n * FRAME_WIDTH + (FRAME_WIDTH - 1 - m)
-                                ];
-                            }
-                        }
-                    }
-                    break;
-                // reverse
-                case 2:
-                    for(size_t l = 0; l < stream_frame_count; l++){
-                        memcpy(
-                            &batch.X[
-                                stream_pixel_sum + l * FRAME_PIXEL_COUNT
-                            ],
-                            &data.data[
-                                data_pixel_offset
-                                + (stream_frame_count - 1 - l) * FRAME_PIXEL_COUNT
-                            ],
-
-                            FRAME_PIXEL_COUNT*sizeof(pixel_type)
-                        );
-                    }
-                    break;
-                // reverse and mirror
-                case 3:
-                    for(size_t l = 0; l < stream_frame_count; l++){
-                        for(size_t m = 0; m < FRAME_WIDTH; m++){
-                            for(size_t n = 0; n < FRAME_HEIGHT; n++){
-                                batch.X[
-                                    stream_pixel_sum + (l * FRAME_PIXEL_COUNT) +
-                                    n * FRAME_WIDTH + m
-                                ] = data.data[
-                                    data_pixel_offset + (stream_frame_count-1-l)
-                                    * FRAME_PIXEL_COUNT +
-                                    n * FRAME_WIDTH + (FRAME_WIDTH - 1 - m)
-                                ];
-                            }
-                        }
-                    }
-                    break;
-            }
-            aggregation_lower_bound_in += label_in;
-            aggregation_lower_bound_out += label_out;
-
-            stream_pixel_sum += stream_pixel_count;
-            stream_frame_sum += stream_frame_count;
+            aggregation_pixel_count = 0;
         }
+        size_t shuffled_id = shuffle.shuffled_ids[i];
 
-        size_t batch_X_ptr = j*longest_merged_stream_pixel_count;
+        auto label_in = data.labels_in[shuffled_id];
+        auto label_out = data.labels_out[shuffled_id];
 
-        std::fill(
-            batch.X + batch_X_ptr + stream_pixel_sum,
-            batch.X + batch_X_ptr + longest_merged_stream_pixel_count,
-            -2
-        );
+        auto video_pixel_count = data.video_pixel_counts[shuffled_id];
+        auto video_frame_count = video_pixel_count / FRAME_PIXEL_COUNT;
+        auto data_pixel_offset = data.video_pixel_offsets[shuffled_id];
 
-        size_t batch_frame_total = stream_pixel_sum / FRAME_PIXEL_COUNT;
-        size_t batch_y_ptr = j*longest_merged_stream_frame_count;
+        int mode = rand() % 4;
+        size_t do_reverse = mode == 2 || mode == 3;
 
-        for(auto ptr : y_ptrs){
-            std::fill(
-                *ptr + batch_y_ptr + batch_frame_total,
-                *ptr + batch_y_ptr + longest_merged_stream_frame_count,
-                -2
+        aggregation_upper_bound_in += do_reverse ? label_out : label_in;
+        aggregation_upper_bound_out += do_reverse ? label_in : label_out;
+
+        size_t batch_pixel_offset =
+            aggregation_pixel_count +
+            aggregation_current_index * longest_aggregation_pixel_count;
+
+        for(auto tmp : y_ptrs){
+            auto ptr = *tmp + batch_pixel_offset/FRAME_PIXEL_COUNT;
+            std::fill(ptr, ptr + video_frame_count,
+                ptr == batch.y_lower_in ? aggregation_lower_bound_in :
+                ptr == batch.y_lower_out ? aggregation_lower_bound_out :
+                ptr == batch.y_upper_in ? aggregation_upper_bound_in :
+                aggregation_upper_bound_out
             );
         }
 
-        batch.current_stream += aggregation_length;
+        switch(mode){
+            // plain copy
+            case 0:
+                memcpy(
+                    &batch.X[batch_pixel_offset],
+                    &data.data[data_pixel_offset],
+
+                    video_pixel_count*sizeof(pixel_type)
+                );
+                break;
+            // mirror
+            case 1:
+                for(size_t j = 0; j < video_frame_count; j++){
+                    auto frame_offset = j * FRAME_PIXEL_COUNT;
+                    for(size_t k = 0; k < FRAME_WIDTH; k++){
+                        for(size_t l = 0; l < FRAME_HEIGHT; l++){
+                            batch.X[
+                                batch_pixel_offset + frame_offset +
+                                l * FRAME_WIDTH + k
+                            ] = data.data[
+                                data_pixel_offset + frame_offset +
+                                l * FRAME_WIDTH + (FRAME_WIDTH - 1 - k)
+                            ];
+                        }
+                    }
+                }
+                break;
+            // reverse
+            case 2:
+                for(size_t j = 0; j < video_frame_count; j++){
+                    memcpy(
+                        &batch.X[
+                            batch_pixel_offset + j * FRAME_PIXEL_COUNT
+                        ],
+                        &data.data[
+                            data_pixel_offset
+                            + (video_frame_count - 1 - j) * FRAME_PIXEL_COUNT
+                        ],
+
+                        FRAME_PIXEL_COUNT*sizeof(pixel_type)
+                    );
+                }
+                break;
+            // reverse and mirror
+            case 3:
+                for(size_t j = 0; j < video_frame_count; j++){
+                    for(size_t k = 0; k < FRAME_WIDTH; k++){
+                        for(size_t l = 0; l < FRAME_HEIGHT; l++){
+                            batch.X[
+                                batch_pixel_offset + (j * FRAME_PIXEL_COUNT) +
+                                l * FRAME_WIDTH + k
+                            ] = data.data[
+                                data_pixel_offset + (video_frame_count-1-j)
+                                * FRAME_PIXEL_COUNT +
+                                l * FRAME_WIDTH + (FRAME_WIDTH - 1 - k)
+                            ];
+                        }
+                    }
+                }
+                break;
+        }
+        aggregation_lower_bound_in += label_in;
+        aggregation_lower_bound_out += label_out;
+
+        aggregation_pixel_count += video_pixel_count;
+
+        batch.aggregation_pixel_counts[aggregation_current_index] =
+            aggregation_pixel_count;
     }
 
-    batch.current_aggregation = last_aggregation;
-    batch.frame_count = batch.batch_size*longest_merged_stream_pixel_count/FRAME_PIXEL_COUNT;
-    batch.batch_id++;
+    for(size_t i=0; i<options.batch_size; i++){
+        size_t aggregation_pixel_count = batch.aggregation_pixel_counts[i];
+        size_t aggregation_batch_pixel_offset = i*longest_aggregation_pixel_count;
+        size_t aggregation_batch_pixel_offset_next =
+            (i+1)*longest_aggregation_pixel_count;
+
+        std::fill(
+            batch.X + aggregation_batch_pixel_offset + aggregation_pixel_count,
+            batch.X + aggregation_batch_pixel_offset_next,
+            MASK_TOKEN
+        );
+
+        size_t aggregation_frame_count =
+            aggregation_pixel_count / FRAME_PIXEL_COUNT;
+
+        size_t aggregation_batch_frame_offset =
+            aggregation_batch_pixel_offset / FRAME_PIXEL_COUNT;
+
+        size_t aggregation_batch_frame_offset_next =
+            aggregation_batch_pixel_offset_next / FRAME_PIXEL_COUNT;
+
+        for(auto ptr : y_ptrs){
+            std::fill(
+                *ptr + aggregation_batch_frame_offset + aggregation_frame_count,
+                *ptr + aggregation_batch_frame_offset_next,
+                MASK_TOKEN
+            );
+        }
+    }
+
+    batch.frame_count = options.batch_size*longest_aggregation_pixel_count/FRAME_PIXEL_COUNT;
 
     Py_RETURN_NONE;
 }
@@ -444,4 +458,8 @@ static PyObject *get_y_lower_out(PyObject *self, PyObject *args) {
 
 static PyObject *get_y_upper_out(PyObject *self, PyObject *args) {
     return get_Y(batch.y_upper_out);
+}
+
+static PyObject *get_batch_count(PyObject *self, PyObject *args) {
+    return PyLong_FromLongLong(options.batch_count);
 }

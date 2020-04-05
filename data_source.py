@@ -71,25 +71,29 @@ class data_source():
         labels_in = self.labels[:]['ins']
         labels_out = self.labels[:]['outs']
         batch_size = 16
-        ext.sequence_shuffle.shuffle(
+        ext.sequence_shuffle.create_shuffle(
             batch_size,
             8,
-            12,
             self.plain_data,
             self.names_and_offsets[:]['begin_offset'],
             labels_in,
             labels_out
         )
+        batch_count = ext.sequence_shuffle.get_batch_count()
         t0 = time.time()
-        for i in range(1, batch_size):
+        for i in range(0, batch_count):
+            print(i)
             ext.sequence_shuffle.create_batch()
-            lower_in = ext.sequence_shuffle.get_y_lower_in()
-            X = ext.sequence_shuffle.get_X()
+            # exit()
+            # lower_in = ext.sequence_shuffle.get_y_lower_in()
+            # X_batch = ext.sequence_shuffle.get_X()
             # print(lower_in.tolist())
             # print(lower_in)
 
+            # X = ext.sequence_shuffle.get_X()
+
             # vid_writer = imageio.get_writer('video.mp4', fps=20)
-            # for j in range(1, 1000):
+            # for j in range(1, 10000):
             #     # as_image = np.reshape(np.floor(X[j]*256), (25, 20, 1))
             #     as_image = np.reshape(np.floor(X[j]*256), (20, 25))
             #     scaled_image = cv2.resize(as_image.astype('uint8'), (32, 32))
