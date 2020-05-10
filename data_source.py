@@ -1,44 +1,44 @@
-from os import listdir
 import numpy as np
 import time
 import ext.sequence_shuffle
 import sys
-import imageio
-import cv2
+from pathlib import Path
 
-data_dir = './data'
+data_dir = Path('./data')
+
+offsets_dtype = np.dtype(np.uint64)
+
+data_dtype = np.single
+
+filename_dtype = 'U32'
 
 names_and_offsets_dtype = np.dtype([
-    ('filename', 'U32'),
+    ('filename', filename_dtype),
     ('begin_offset', np.uint64),
     ('end_offset', np.uint64),
     ('frame_count', np.uint64)])
 
 labels_dtype = np.dtype([
-    ('filename', 'U32'),
-    ('ins', np.uint64),
-    ('outs', np.uint64)]
+    ('filename', filename_dtype),
+    ('boarding', np.uint64),
+    ('alighting', np.uint64)]
 )
+
+plain_filename = data_dir / "data.npy"
+names_and_offsets_filename = data_dir / "names_and_offsets.npy"
+labels_filename = data_dir / 'labels.csv'
 
 class data_source():
     def __init__(self):
-        self.plain_filename = data_dir+'/data.npy'
-        self.names_and_offsets_filename = data_dir+'/index.npy'
-        self.plain_data = np.array([], dtype=np.single)
-        self.names_and_offsets = \
-            np.array([], dtype=names_and_offsets_dtype)
-        self.offsets_only = np.array([], dtype=np.uint64)
-
-    def enable(self):
-        self.plain_data = np.load(self.plain_filename, mmap_mode='r')
-        self.names_and_offsets = np.load(self.names_and_offsets_filename)
+        self.data = np.load(plain_filename, mmap_mode='r')
+        self.names_and_offsets = np.load(names_and_offsets_filename)
         labels = np.sort(np.loadtxt(
-            'data/labels.csv', skiprows=1, delimiter=',', dtype=labels_dtype,
+            labels_filename, skiprows=1, delimiter=',', dtype=labels_dtype,
             usecols=[1,2,3]
         ), order='filename')
         self.labels = np.empty(self.names_and_offsets.shape, np.dtype([
-            ('ins', np.uint64),
-            ('outs', np.uint64)])
+            ('boarding', np.uint64),
+            ('alighting', np.uint64)])
         )
         for name_and_offset in enumerate(self.names_and_offsets):
             filename = name_and_offset[1][0][:-4]
@@ -64,46 +64,33 @@ class data_source():
         e = self.names_and_offsets[index]
         if e['filename'] != filename:
             return None
-        return self.plain_data[e['begin_offset']:e['end_offset']]
+        return self.data[e['begin_offset']:e['end_offset']]
 
-    def shuffle(self):
+    def shuffle_c(self):
         # some placeholder labels
-        labels_in = self.labels[:]['ins']
-        labels_out = self.labels[:]['outs']
+        labels_boarding = self.labels[:]['boarding']
+        labels_alighting = self.labels[:]['alighting']
         batch_size = 16
         ext.sequence_shuffle.create_shuffle(
             batch_size,
             8,
-            self.plain_data,
-            self.names_and_offsets[:]['begin_offset'],
-            labels_in,
-            labels_out
+            self.data.reshape((-1, 500)),
+            self.names_and_offsets[:]['begin_offset']*500,
+            labels_boarding,
+            labels_alighting
         )
         batch_count = ext.sequence_shuffle.get_batch_count()
         t0 = time.time()
         for i in range(0, batch_count):
             print(i)
             ext.sequence_shuffle.create_batch()
-            # exit()
-            # lower_in = ext.sequence_shuffle.get_y_lower_in()
-            # X_batch = ext.sequence_shuffle.get_X()
-            # print(lower_in.tolist())
-            # print(lower_in)
-
-            # X = ext.sequence_shuffle.get_X()
-
-            # vid_writer = imageio.get_writer('video.mp4', fps=20)
-            # for j in range(1, 10000):
-            #     # as_image = np.reshape(np.floor(X[j]*256), (25, 20, 1))
-            #     as_image = np.reshape(np.floor(X[j]*256), (20, 25))
-            #     scaled_image = cv2.resize(as_image.astype('uint8'), (32, 32))
-            #     # print(X[j]*256)
-            #     vid_writer.append_data(scaled_image)
-            # vid_writer.close()
-
-            # if i == 1:
-            #     exit()
+            # TODO do something here
 
         t1 = time.time()
         print((t1-t0))
         # print(sequence_shuffle.shuffle(arr, 3.0))
+
+if __name__ == "__main__":
+    ds = data_source()
+    frames = ds.get_file("001_20160526_030141.uff")
+    data_source.create_video(frames, "video.mp4")
