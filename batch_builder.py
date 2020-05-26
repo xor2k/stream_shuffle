@@ -11,11 +11,19 @@ class DataMode(Enum):
 
 class batch_builder():
     def __init__(self, train_and_test):
-        self.data_source = train_and_test.data_source
+        ds = train_and_test.data_source
+        self.data_source = ds
         self.train_and_test = train_and_test
         self.batch_size = 16
-        self.aggregation_size = 8
-        self.batch_video_count = self.batch_size * self.aggregation_size
+        self.max_videos_per_batch_element = 6
+        frame_counts = ds.names_and_offsets[train_and_test.train_indices]["frame_count"]
+        self.max_frame_count = np.inf; # int(np.mean(frame_counts)+1) * self.max_videos_per_batch_element
+        self.epochial = True
+        self.completed_epochs_count = None
+        self.next_video_index = None
+        self.batch_video_count = self.batch_size * self.max_videos_per_batch_element
+        self.train_index_permutation_iterator = None
+        self.train_index_permutation = None
         self.video_count = self.data_source.names_and_offsets.shape[0]
         self.train_batch_count = \
             self.train_and_test.train_indices.size // self.batch_video_count
@@ -24,6 +32,12 @@ class batch_builder():
         # TODO make this math.ceil one day
         self.test_batch_count = \
             self.train_and_test.test_indices.size // self.batch_video_count
+
+        self.reset_stats()
+
+    def reset_stats(self):
+        self.used_frame_count = 0
+        self.total_frame_count = 0
 
     def make_shuffling(self):
         return util.make_shuffling(self.train_and_test.train_indices.size)
@@ -35,123 +49,134 @@ class batch_builder():
         return self.make_batch(
             video_index_shuffling, batch_index, frame_step, DataMode.TRAIN_DATA
         )
-    
+
     def test_batch(
-        self, video_index_shuffling, batch_index, frame_step=1
+        self, batch_index, frame_step=1
     ):
         return self.make_batch(
-            video_index_shuffling, batch_index, frame_step, DataMode.TEST_DATA
+            range(self.test_batch_count), batch_index, frame_step, DataMode.TEST_DATA
         )
-    
-    def make_batch(
-        self, video_index_shuffling, batch_index, frame_step, data_mode
-    ):
+
+    def get_next_video_index(self):
+        tt = self.train_and_test
+
+        if self.epochial:
+
+            if self.train_index_permutation is None or \
+                self.train_index_permutation_iterator == tt.train_indices.size:
+
+                self.train_index_permutation = np.random.permutation(tt.train_indices)
+                self.train_index_permutation_iterator = 0
+
+                if self.completed_epochs_count is None:
+                    self.completed_epochs_count = 0
+                else:
+                    self.completed_epochs_count += 1
+
+            retval = self.train_index_permutation[self.train_index_permutation_iterator] if \
+                self.next_video_index is None else self.next_video_index
+
+            self.train_index_permutation_iterator += 1
+
+            return retval
+
+        else:
+
+            return np.random.choice(
+                tt.train_indices
+            ) if self.next_video_index == None else self.next_video_index
+
+    def set_next_video_index(self, video_index):
+        self.next_video_index = video_index
+
+    def make_batch(self):
         ds = self.data_source
         tt = self.train_and_test
         batch_video_count = self.batch_video_count
         batch_size = self.batch_size
-        aggregation_size = self.aggregation_size
-
+        max_frame_count = self.max_frame_count
         data = ds.data
 
-        first_video_offset = batch_index*batch_video_count
-        last_video_offset = (batch_index+1)*batch_video_count
+        layout = []
 
-        inner_loop_dimensions = (batch_size, aggregation_size)
+        batch_element = 0
 
-        video_index_raw = tt.train_indices[
-            video_index_shuffling[first_video_offset:last_video_offset]
-        ] if data_mode == DataMode.TRAIN_DATA else tt.test_indices[
-            first_video_offset:last_video_offset
-        ]
+        while batch_element < batch_size:
+            begin_offset = 0
+            layout_batch_element = []
+            for i in range(self.max_videos_per_batch_element):
+                video_index = self.get_next_video_index()
 
-        labels = np.reshape(ds.labels[video_index_raw], inner_loop_dimensions)
+                frame_count = ds.names_and_offsets[video_index]["frame_count"]
+                end_offset = int(begin_offset + frame_count)
+                data_first_frame = ds.names_and_offsets[video_index]["begin_offset"]
+                data_last_frame = int(data_first_frame + frame_count)
 
-        video_frame_count = ds.names_and_offsets[video_index_raw]["frame_count"]
+                if i > 0 and end_offset > max_frame_count or \
+                    i == self.max_videos_per_batch_element-1:
 
-        data_video_offset = np.reshape(
-            ds.names_and_offsets[video_index_raw]["begin_offset"],
-            inner_loop_dimensions
+                    self.set_next_video_index(video_index)
+
+                    break
+
+                self.set_next_video_index(None)
+
+                flip_vertical = np.random.choice([0,1])
+                flip_temporal = np.random.choice([0,1])
+
+                boarding_entry = "alighting" if flip_temporal else "boarding"
+                alighting_entry = "boarding" if flip_temporal else "alighting"
+
+                boarding = ds.labels[video_index][boarding_entry]
+                alighting = ds.labels[video_index][alighting_entry]
+
+                layout_batch_element.append((
+                    begin_offset, end_offset, data_first_frame, data_last_frame,
+                    flip_vertical, flip_temporal, boarding, alighting
+                ))
+
+                begin_offset = end_offset
+
+            batch_element += 1
+            layout.append(layout_batch_element)
+
+        max_frame_count = max(e[-1][1] for e in layout)
+        self.total_frame_count += max_frame_count*batch_size
+        self.used_frame_count += sum(e[-1][1] for e in layout)
+
+        x = np.empty(
+            (max_frame_count, batch_size) + data.shape[1:], dtype=data.dtype
         )
 
-        # aggregation_video_filename = np.reshape(
-        #     ds.names_and_offsets[video_index_raw]["filename"],
-        #     inner_loop_dimensions
-        # )
+        y = np.zeros((max_frame_count, batch_size, 8), dtype=data.dtype)
 
-        aggregation_video_length = np.reshape(
-            video_frame_count, inner_loop_dimensions
-        )
+        for batch_element, tmp in enumerate(layout):
+            end_offset = None
 
-        aggregation_video_offset = np.zeros_like(aggregation_video_length)
-        aggregation_video_offset[:,1:] = np.cumsum(
-            aggregation_video_length, axis=1
-        )[:,0:-1]
+            for layout_batch_element in tmp:
+                (
+                    begin_offset, end_offset, data_first_frame, data_last_frame,
+                    flip_vertical, flip_temporal, boarding, alighting
+                ) = layout_batch_element
 
-        aggregation_frame_count = np.sum(aggregation_video_length, axis=1)
+                door_close_frame = int(end_offset-1)
 
-        aggregation_max_frame_count = np.amax(aggregation_frame_count)
+                x[
+                    begin_offset:end_offset,batch_element
+                ] = data[data_first_frame:data_last_frame][
+                    ::(-1 if flip_temporal else 1)
+                ][
+                    :,:,::(-1 if flip_vertical else 1)
+                ]
 
-        X_frames = np.empty(
-            (aggregation_max_frame_count,batch_size)+data.shape[1:], dtype=data.dtype
-        )
+                y[door_close_frame, batch_element, (0,1,6,7)] = \
+                    [boarding, alighting, 1, 1]
 
-        y_boarding_lower_bound = np.zeros(
-            (aggregation_max_frame_count, batch_size), dtype=data.dtype
-        )
-        y_alighting_lower_bound = np.zeros_like(y_boarding_lower_bound)
+                y[begin_offset, batch_element, 2:4] = [boarding, alighting]
 
-        y_boarding_upper_bound = np.zeros_like(y_boarding_lower_bound)
-        y_alighting_upper_bound = np.zeros_like(y_boarding_lower_bound)
+            y[:end_offset,batch_element,4:6] = 1
 
-        for (batch_entry, aggregation_entry) in itertools.product(
-            range(batch_size), range(aggregation_size)
-        ):
-            video_frame_count = aggregation_video_length[batch_entry][aggregation_entry]
+        for i in range(4):
+            y[:,:,i] = np.cumsum(y[:,:,i], axis=0)
 
-            video_first_frame_index = data_video_offset[batch_entry][aggregation_entry]
-            video_last_frame_index = video_first_frame_index + video_frame_count
-
-            aggregation_first_frame = aggregation_video_offset[batch_entry][aggregation_entry]
-            aggregation_last_frame = aggregation_first_frame + video_frame_count
-
-            flip_vertical = util.randbit() if data_mode == DataMode.TRAIN_DATA else 0
-            flip_temporal = util.randbit() if data_mode == DataMode.TRAIN_DATA else 0
-
-            X_frames[
-                aggregation_first_frame:aggregation_last_frame,batch_entry
-            ] = data[video_first_frame_index:video_last_frame_index][
-                ::(-1 if flip_temporal else 1)][:,::(-1 if flip_vertical else 1)
-            ]
-
-            boarding_entry = "alighting" if flip_temporal else "boarding"
-            alighting_entry = "boarding" if flip_temporal else "alighting"
-
-            boarding = labels[batch_entry][aggregation_entry][boarding_entry]
-            alighting = labels[batch_entry][aggregation_entry][alighting_entry]
-
-            door_close_frame = np.array(
-                aggregation_last_frame-1, aggregation_last_frame.dtype
-            )
-
-            # if aggregation_last_frame != aggregation_frame_count[batch_entry]:
-            y_boarding_lower_bound[door_close_frame, batch_entry] = boarding
-            y_alighting_lower_bound[door_close_frame, batch_entry] = alighting
-
-            y_boarding_upper_bound[aggregation_first_frame, batch_entry] = boarding
-            y_alighting_upper_bound[aggregation_first_frame, batch_entry] = alighting
-
-        y_boarding_lower_bound = np.cumsum(y_boarding_lower_bound, axis=0)
-        y_boarding_upper_bound = np.cumsum(y_boarding_upper_bound, axis=0)
-        y_alighting_lower_bound = np.cumsum(y_alighting_lower_bound, axis=0)
-        y_alighting_upper_bound = np.cumsum(y_alighting_upper_bound, axis=0)
-
-        return (
-            aggregation_video_length,
-            aggregation_frame_count,
-            X_frames,
-            y_boarding_lower_bound,
-            y_boarding_upper_bound,
-            y_alighting_lower_bound,
-            y_alighting_upper_bound
-        )
+        return x, y
